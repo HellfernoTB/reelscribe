@@ -1,0 +1,34 @@
+# reelscribe HTTP ingestion endpoint (systemd *user* service).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/reelscribe-serve.service ~/.config/systemd/user/
+#   # serve.env must contain at least REELSCRIBE_TOKEN; this setup keeps the
+#   # whole data root under the repo:
+#   #   REELSCRIBE_TOKEN=...
+#   #   REELSCRIBE_HOME=%h/reelscribe
+#   #   REELSCRIBE_MODEL=medium            # optional
+#   loginctl enable-linger "$USER"         # run without an active login session
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now reelscribe-serve
+#   systemctl --user status reelscribe-serve
+#
+# If your data root is elsewhere, change EnvironmentFile= below and set
+# REELSCRIBE_HOME inside that file.
+#
+# Logs:  journalctl --user -u reelscribe-serve -f
+
+[Unit]
+Description=reelscribe HTTP ingestion endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/reelscribe/serve.env
+ExecStart=%h/.local/bin/reelscribe serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
