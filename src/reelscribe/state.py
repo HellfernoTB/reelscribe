@@ -95,6 +95,57 @@ def apply_migrations(conn: psycopg.Connection) -> list[str]:
     return applied
 
 
+class WorkerLock:
+    """Session-level advisory lock: at most one queue worker (``run`` or ``serve``) at a time.
+
+    The lock lives on a dedicated long-lived connection and is scoped to the
+    connection's current schema, so it vanishes if the process dies. Only the
+    holder may reset stale ``running`` rows or claim work.
+    """
+
+    _KEY = 7203_1702
+
+    def __init__(self, dsn: str):
+        self._dsn = dsn
+        self._conn: psycopg.Connection | None = None
+
+    def acquire(self) -> bool:
+        if self.held():
+            return True
+        conn = psycopg.connect(self._dsn, connect_timeout=5, autocommit=True)
+        try:
+            ok = conn.execute(
+                "SELECT pg_try_advisory_lock(%s, hashtext(current_schema()))", (self._KEY,)
+            ).fetchone()[0]
+        except Exception:
+            conn.close()
+            raise
+        if not ok:
+            conn.close()
+            return False
+        self._conn = conn
+        return True
+
+    def held(self) -> bool:
+        """True while the lock connection is alive (a dropped connection loses the lock)."""
+        if self._conn is None:
+            return False
+        try:
+            self._conn.execute("SELECT 1")
+            return True
+        except psycopg.Error:
+            self.release()
+            return False
+
+    def release(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except psycopg.Error:
+                pass
+
+
 class State:
     """Repository over the reel tables. ``dsn`` is a libpq connection string/URL."""
 
@@ -108,6 +159,9 @@ class State:
         with state._connect() as conn:
             apply_migrations(conn)
         return state
+
+    def worker_lock(self) -> WorkerLock:
+        return WorkerLock(self.dsn)
 
     def _connect(self) -> psycopg.Connection:
         return psycopg.connect(self.dsn, connect_timeout=5, row_factory=dict_row)
@@ -159,7 +213,11 @@ class State:
                 )
 
     def reset_stale_running(self) -> int:
-        """Startup recovery: a crashed worker leaves rows ``running``."""
+        """Startup recovery: a crashed worker leaves rows ``running``.
+
+        Only call this while holding the ``WorkerLock``, otherwise it would steal
+        a live worker's claims.
+        """
         with self._connect() as conn:
             return conn.execute(
                 "UPDATE reel SET status = 'pending' WHERE status = 'running'"

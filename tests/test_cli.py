@@ -205,3 +205,18 @@ def test_clean_deletes_audio_keeps_transcript(monkeypatch, home, db):
     assert not audio.exists()
     assert transcript.exists()
     assert db.get("https://insta/reel/A")["audio_path"] is None
+
+
+def test_run_refuses_when_another_worker_holds_lock(monkeypatch, home, db, capsys):
+    _wire(monkeypatch)
+    cli.main(["add", "https://insta/reel/A"])
+    db.reset_stale_running()
+    other = db.worker_lock()
+    assert other.acquire()
+    try:
+        assert cli.main(["run"]) == 1
+    finally:
+        other.release()
+    assert "another reelscribe worker is running" in capsys.readouterr().err
+    assert db.get("https://insta/reel/A")["status"] == "pending"
+    assert cli.main(["run"]) == 0  # lock was free again

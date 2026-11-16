@@ -26,6 +26,8 @@ from .state import State, normalize_url
 from .transcribe import Transcriber
 
 
+LOCK_RETRY_SECONDS = 5.0
+
 # --------------------------------------------------------------------- routing
 
 
@@ -72,6 +74,8 @@ class Ingest:
         self._run_once = run_once or self._default_drain
         self._state = State(cfg.require_database_url())
         self._ready = False
+        self._ready_lock = threading.Lock()
+        self._lock = self._state.worker_lock()
         self._transcriber: Transcriber | None = None
 
         self._cv = threading.Condition()
@@ -82,11 +86,24 @@ class Ingest:
 
     # -- public API --------------------------------------------------
     def _ensure_ready(self) -> None:
-        """Migrate the schema and recover rows a crashed worker left 'running'."""
-        if not self._ready:
-            self._state = State.open(self._cfg.require_database_url())
-            self._state.reset_stale_running()
-            self._ready = True
+        """Migrate the schema once (thread-safe)."""
+        with self._ready_lock:
+            if not self._ready:
+                self._state = State.open(self._cfg.require_database_url())
+                self._lock = self._state.worker_lock()
+                self._ready = True
+
+    def _acquire_worker_lock(self) -> bool:
+        """Wait until we are the only worker; the holder also recovers stale claims."""
+        while not self._lock.held():
+            if self._lock.acquire():
+                self._state.reset_stale_running()
+                return True
+            print("reelscribe: another worker holds the queue lock, waiting", file=sys.stderr, flush=True)
+            with self._cv:
+                if self._cv.wait_for(lambda: self._stop, timeout=LOCK_RETRY_SECONDS):
+                    return False
+        return True
 
     def enqueue(self, url: str) -> tuple[str, bool]:
         self._ensure_ready()
@@ -112,6 +129,7 @@ class Ingest:
             self._cv.notify_all()
         if self._thread:
             self._thread.join(timeout=5)
+        self._lock.release()
 
     def wait_idle(self, timeout: float = 5.0) -> bool:
         """Block until the worker has processed every enqueue so far."""
@@ -136,6 +154,8 @@ class Ingest:
 
     def _default_drain(self) -> None:
         self._ensure_ready()
+        if not self._acquire_worker_lock():
+            return
         pending = self._state.to_process()  # claims the rows ('running')
         if not pending:
             return

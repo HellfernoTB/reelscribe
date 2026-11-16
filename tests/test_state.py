@@ -180,3 +180,29 @@ def test_list_items_failed_only(state):
     state.mark_failed("https://x/2", "e")
     assert [r["url"] for r in state.list_items(failed_only=True)] == ["https://x/2"]
     assert len(state.list_items()) == 2
+
+
+def test_worker_lock_excludes_second_worker(state, pg_url):
+    state.add("https://x/reel/1")
+    first, second = state.worker_lock(), State(pg_url).worker_lock()
+    assert first.acquire()
+    assert first.acquire()  # re-acquire while held is a no-op
+    assert not second.acquire()  # second worker can neither reset nor claim
+    assert state.to_process() == ["https://x/reel/1"]  # first worker's claim ...
+    assert not second.acquire()  # ... stays safe: it cannot reach reset_stale_running
+    first.release()
+    assert second.acquire()
+    second.release()
+
+
+def test_worker_lock_is_per_schema(pg_url):
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        conn.execute("CREATE SCHEMA other_lock_schema")
+        try:
+            other = pg_url.rsplit("search_path", 1)[0] + "search_path%3Dother_lock_schema"
+            a, b = State(pg_url).worker_lock(), State(other).worker_lock()
+            assert a.acquire() and b.acquire()
+            a.release()
+            b.release()
+        finally:
+            conn.execute("DROP SCHEMA other_lock_schema CASCADE")

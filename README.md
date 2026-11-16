@@ -65,7 +65,7 @@ a human-readable export, not the source of truth. Set
 
 Failed items are retried automatically at most 5 times; `reelscribe retry`
 resets them explicitly. Rows claimed by a crashed run (`running`) go back to
-`pending` at the next `run` or `serve` start.
+`pending` when the next worker (`run` or `serve`) takes the lock.
 
 To migrate an old file-based install, run `scripts/import_to_pg.py` once
 (`--replace` to redo it).
@@ -211,8 +211,11 @@ curl "http://homelab:8765/add?token=YOURTOKEN&url=https://www.instagram.com/reel
 - The token is the only thing protecting the endpoint. Keep Tailscale ACLs tight
   and don't expose port 8765 to the public internet.
 - Pick **one** ingestion method. Running `serve` and a `reelscribe run` cron at
-  the same time works (rows are claimed with `FOR UPDATE SKIP LOCKED`, nothing is processed twice) but wastes CPU transcribing in
-  parallel.
+  the same time is refused: each worker holds a PostgreSQL advisory lock for its lifetime, so
+  `reelscribe run` exits with "another reelscribe worker is running" while `serve`
+  is up (and `serve` waits and retries while a `run` is active; `/add` still queues).
+  Only the lock holder claims rows or resets stale `running` ones, so a reel is
+  never transcribed twice.
 - Private / login-walled reels still need `REELSCRIBE_COOKIES` in `serve.env`.
 
 ## Troubleshooting

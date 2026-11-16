@@ -269,14 +269,41 @@ def test_server_returns_503_over_http_when_db_down(tmp_path):
         t.join(timeout=2)
 
 
-def test_startup_resets_stale_running_rows(db_env, pg_url):
+def test_drain_resets_stale_running_rows_under_lock(db_env, pg_url, monkeypatch):
     state = State.open(pg_url)
     state.add("https://x/reel/A")
     assert state.to_process() == ["https://x/reel/A"]  # a crashed worker left it running
-    ingest = serve.Ingest(Config(environ=db_env), run_once=lambda: None)
-    ingest.start()
+    seen = []
+    monkeypatch.setattr(serve, "process_item", lambda cfg, t, url: seen.append(url) or {
+        "text": "t", "transcribed_at": datetime.now(timezone.utc), "transcript_file": None})
+    monkeypatch.setattr(serve, "Transcriber", lambda *a, **k: object())
+    ingest = serve.Ingest(Config(environ=db_env))
+    ingest._default_drain()
     ingest.stop()
-    assert state.get("https://x/reel/A")["status"] == "pending"
+    assert seen == ["https://x/reel/A"]
+    assert state.get("https://x/reel/A")["status"] == "done"
+
+
+def test_drain_waits_while_another_worker_holds_lock(db_env, pg_url, monkeypatch):
+    monkeypatch.setattr(serve, "LOCK_RETRY_SECONDS", 0.05)
+    state = State.open(pg_url)
+    state.add("https://x/reel/A")
+    other = state.worker_lock()
+    assert other.acquire()
+    seen = []
+    monkeypatch.setattr(serve, "process_item", lambda cfg, t, url: seen.append(url) or {
+        "text": "t", "transcribed_at": datetime.now(timezone.utc), "transcript_file": None})
+    monkeypatch.setattr(serve, "Transcriber", lambda *a, **k: object())
+    ingest = serve.Ingest(Config(environ=db_env))
+    ingest.start()
+    ingest.enqueue("https://x/reel/B")  # /add still works while another worker holds the lock
+    import time
+    time.sleep(0.3)
+    assert seen == [] and state.get("https://x/reel/A")["status"] == "pending"
+    other.release()
+    ingest.wait_idle(timeout=5)
+    ingest.stop()
+    assert sorted(seen) == ["https://x/reel/A", "https://x/reel/B"]
 
 
 def test_default_drain_processes_and_releases(db_env, pg_url, monkeypatch):
@@ -295,6 +322,7 @@ def test_default_drain_processes_and_releases(db_env, pg_url, monkeypatch):
     ingest.enqueue("https://x/reel/ok")
     ingest.enqueue("https://x/reel/bad")
     ingest._default_drain()
+    ingest.stop()
     state = State(pg_url)
     assert state.get("https://x/reel/ok")["status"] == "done"
     bad = state.get("https://x/reel/bad")

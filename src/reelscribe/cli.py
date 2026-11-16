@@ -69,7 +69,18 @@ def cmd_run(cfg: Config, only: str | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
 
-    state.reset_stale_running()
+    lock = state.worker_lock()
+    if not lock.acquire():
+        print("another reelscribe worker is running", file=sys.stderr)
+        return 1
+    try:
+        return _run_locked(cfg, state, only)
+    finally:
+        lock.release()
+
+
+def _run_locked(cfg: Config, state: State, only: str | None) -> int:
+    state.reset_stale_running()  # safe: we hold the worker lock
 
     if only is not None:
         key = normalize_url(only)
