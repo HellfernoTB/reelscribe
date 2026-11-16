@@ -50,19 +50,35 @@ Everything lives under `~/reelscribe/` by default, overridable with
 
 ```
 ~/reelscribe/
-  state.json      # the queue + status of every link
   audio/          # extracted mp3s
-  transcripts/    # output markdown
+  transcripts/    # Markdown export (REELSCRIBE_WRITE_MARKDOWN=1, default)
   run.log         # only when you redirect cron output here
 ```
 
+The queue and the transcripts live in PostgreSQL (`REELSCRIBE_DATABASE_URL`,
+required; schema `instagram_recap` via the role's `search_path`). Tables:
+`reel` (status, attempts, caption, uploader, yt-dlp metadata, relative
+`audio_path`), `transcript` and `transcript_segment`. They are created and
+migrated automatically at startup (`schema_migrations`). The Markdown files are
+a human-readable export, not the source of truth. Set
+`REELSCRIBE_WRITE_MARKDOWN=0` to stop writing them.
+
+Failed items are retried automatically at most 5 times; `reelscribe retry`
+resets them explicitly. Rows claimed by a crashed run (`running`) go back to
+`pending` at the next `run` or `serve` start.
+
+To migrate an old file-based install, run `scripts/import_to_pg.py` once
+(`--replace` to redo it).
+
 ## Configuration
 
-All environment variables, all optional:
+All environment variables are optional except `REELSCRIBE_DATABASE_URL`:
 
 | Var | Default | Purpose |
 |---|---|---|
-| `REELSCRIBE_HOME` | `~/reelscribe` | Data root |
+| `REELSCRIBE_DATABASE_URL` | unset (**required**) | PostgreSQL URL for the queue and transcripts; keep it in a mode-600 env file |
+| `REELSCRIBE_WRITE_MARKDOWN` | `1` | `0` disables the Markdown export |
+| `REELSCRIBE_HOME` | `~/reelscribe` | Data root (audio, Markdown export) |
 | `REELSCRIBE_MODEL` | `medium` | `tiny` / `base` / `small` / `medium` / `large-v3` |
 | `REELSCRIBE_LANG` | auto | Force `fr` or `en`, skipping detection |
 | `REELSCRIBE_TRANSLATE` | unset | `1` adds an English rendering of non-English audio |
@@ -186,7 +202,7 @@ curl "http://homelab:8765/add?token=YOURTOKEN&url=https://www.instagram.com/reel
 | Route | |
 |---|---|
 | `GET /health` | `{"status":"ok"}`, no token |
-| `GET/POST /add?url=…&token=…` | `202 {"queued":…}` new · `200 {"skipped":…}` already known · `400` missing url · `401` bad token |
+| `GET/POST /add?url=…&token=…` | `202 {"queued":…}` new · `200 {"skipped":…}` already known · `400` missing url · `401` bad token · `503` database unreachable (retry later) |
 
 ### Caveats
 
@@ -195,7 +211,7 @@ curl "http://homelab:8765/add?token=YOURTOKEN&url=https://www.instagram.com/reel
 - The token is the only thing protecting the endpoint. Keep Tailscale ACLs tight
   and don't expose port 8765 to the public internet.
 - Pick **one** ingestion method. Running `serve` and a `reelscribe run` cron at
-  the same time works (state writes are atomic) but wastes CPU transcribing in
+  the same time works (rows are claimed with `FOR UPDATE SKIP LOCKED`, nothing is processed twice) but wastes CPU transcribing in
   parallel.
 - Private / login-walled reels still need `REELSCRIBE_COOKIES` in `serve.env`.
 

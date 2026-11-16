@@ -18,6 +18,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlparse
 
+import psycopg
+
 from .config import Config
 from .pipeline import process_item
 from .state import State, normalize_url
@@ -44,7 +46,11 @@ def handle(method: str, path: str, params: dict, cfg: Config, enqueue) -> tuple[
     if not url:
         return 400, {"error": "missing url"}
 
-    normalized, is_new = enqueue(url)
+    try:
+        normalized, is_new = enqueue(url)
+    except psycopg.OperationalError as exc:
+        print(f"[serve] database unavailable: {exc}", file=sys.stderr, flush=True)
+        return 503, {"error": "database unavailable"}
     if is_new:
         return 202, {"queued": normalized}
     return 200, {"skipped": normalized}
@@ -54,13 +60,18 @@ def handle(method: str, path: str, params: dict, cfg: Config, enqueue) -> tuple[
 
 
 class Ingest:
-    """Queue writes + a single background worker that drains pending items."""
+    """Queue writes + a single background worker that drains pending items.
+
+    No queue state is cached here: every operation is a short transaction on
+    ``State``. If the database is down at startup the server still starts and
+    retries on first use.
+    """
 
     def __init__(self, cfg: Config, run_once=None):
         self._cfg = cfg
         self._run_once = run_once or self._default_drain
-        self._state = State.load(cfg.state_file)
-        self._state_lock = threading.Lock()
+        self._state = State(cfg.require_database_url())
+        self._ready = False
         self._transcriber: Transcriber | None = None
 
         self._cv = threading.Condition()
@@ -70,10 +81,16 @@ class Ingest:
         self._thread: threading.Thread | None = None
 
     # -- public API --------------------------------------------------
+    def _ensure_ready(self) -> None:
+        """Migrate the schema and recover rows a crashed worker left 'running'."""
+        if not self._ready:
+            self._state = State.open(self._cfg.require_database_url())
+            self._state.reset_stale_running()
+            self._ready = True
+
     def enqueue(self, url: str) -> tuple[str, bool]:
-        with self._state_lock:
-            key = self._state.add(url)
-            self._state.save()
+        self._ensure_ready()
+        key = self._state.add(url)
         is_new = key is not None
         if is_new:
             with self._cv:
@@ -82,6 +99,10 @@ class Ingest:
         return normalize_url(url), is_new
 
     def start(self) -> None:
+        try:
+            self._ensure_ready()
+        except psycopg.Error as exc:
+            print(f"reelscribe: database not ready at startup: {exc}", file=sys.stderr, flush=True)
         self._thread = threading.Thread(target=self._loop, name="reelscribe-worker", daemon=True)
         self._thread.start()
 
@@ -114,26 +135,27 @@ class Ingest:
                 self._cv.notify_all()
 
     def _default_drain(self) -> None:
-        with self._state_lock:
-            pending = self._state.to_process()
+        self._ensure_ready()
+        pending = self._state.to_process()  # claims the rows ('running')
         if not pending:
             return
-        if self._transcriber is None:
-            self._transcriber = Transcriber(
-                self._cfg.model, device=self._cfg.device, language=self._cfg.language
-            )
-        for url in pending:
-            try:
-                fields = process_item(self._cfg, self._transcriber, url)
-                with self._state_lock:
+        try:
+            if self._transcriber is None:
+                self._transcriber = Transcriber(
+                    self._cfg.model, device=self._cfg.device, language=self._cfg.language
+                )
+            while pending:
+                url = pending[0]
+                try:
+                    fields = process_item(self._cfg, self._transcriber, url)
                     self._state.mark_done(url, **fields)
-                    self._state.save()
-                print(f"transcribed {url} -> {fields['transcript']}", flush=True)
-            except Exception as exc:
-                with self._state_lock:
+                    print(f"transcribed {url} -> {fields['transcript_file'] or 'database'}", flush=True)
+                except Exception as exc:
                     self._state.mark_failed(url, str(exc))
-                    self._state.save()
-                print(f"FAILED {url}: {exc}", file=sys.stderr, flush=True)
+                    print(f"FAILED {url}: {exc}", file=sys.stderr, flush=True)
+                pending.pop(0)
+        finally:
+            self._state.release(pending)  # anything still claimed goes back to the queue
 
 
 # --------------------------------------------------------------------- http

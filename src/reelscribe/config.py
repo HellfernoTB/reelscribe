@@ -48,6 +48,11 @@ class Config:
             self.delay = DEFAULT_DELAY
 
         self.token = env.get("REELSCRIBE_TOKEN") or None
+        # Required for queue state (see ``require_database_url``); secrets live in serve.env.
+        self.database_url = env.get("REELSCRIBE_DATABASE_URL") or None
+        self.write_markdown = (env.get("REELSCRIBE_WRITE_MARKDOWN") or "1").strip().lower() not in (
+            "0", "false", "no", "off",
+        )
         self.serve_host, self.serve_port = self._parse_addr(
             env.get("REELSCRIBE_SERVE_ADDR") or DEFAULT_SERVE_ADDR
         )
@@ -72,9 +77,10 @@ class Config:
             raise ConfigError(f"REELSCRIBE_SERVE_ADDR={raw!r} is not HOST:PORT or PORT")
 
     # --- derived paths -------------------------------------------------
-    @property
-    def state_file(self) -> Path:
-        return self.home / "state.json"
+    def require_database_url(self) -> str:
+        if not self.database_url:
+            raise ConfigError("REELSCRIBE_DATABASE_URL must be set (PostgreSQL connection URL)")
+        return self.database_url
 
     @property
     def audio_dir(self) -> Path:

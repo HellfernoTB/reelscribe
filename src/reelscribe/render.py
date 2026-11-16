@@ -74,6 +74,40 @@ def build_markdown(
     return "\n".join(lines) + "\n"
 
 
+def build_record(
+    *,
+    meta: dict,
+    result,
+    english: str | None = None,
+    note: str | None = None,
+    model: str | None = None,
+    transcribed_at: datetime,
+) -> dict:
+    """Structured counterpart of ``build_markdown``: the fields stored in PostgreSQL.
+
+    Keys match ``State.mark_done`` (minus the file/audio paths added by the pipeline).
+    ``segments`` carry float start/end seconds.
+    """
+    duration = meta.get("duration")
+    return {
+        "title": (meta.get("title") or "").strip() or None,
+        "uploader": meta.get("uploader") or None,
+        "duration_s": float(duration) if duration else None,
+        "caption": (meta.get("description") or "").strip() or None,
+        "language": result.language,
+        "text": result.text or "",
+        "english_text": english.strip() if english else None,
+        "note": note,
+        "model": model,
+        "transcribed_at": transcribed_at,
+        "segments": [
+            {"start": float(start), "end": float(end), "text": text}
+            for start, end, text in result.rows
+        ],
+        "ytdlp_meta": meta,
+    }
+
+
 def write_transcript(transcript_dir, stem: str, markdown: str) -> Path:
     path = Path(transcript_dir) / f"{stem}.md"
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "yt-dlp",
     "faster-whisper",
+    "psycopg[binary]",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +22,9 @@ reelscribe = "reelscribe.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+reelscribe = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

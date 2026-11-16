@@ -82,3 +82,23 @@ def test_slugify_handles_unicode_and_symbols():
 
 def test_make_stem():
     assert make_stem(FIXTURE) == "C9xYzAbCdEf-how-to-cook-the-perfect-omelette"
+
+
+def test_build_record_structured_fields():
+    from datetime import datetime, timezone
+
+    from reelscribe.render import build_record
+
+    when = datetime(2026, 8, 31, 12, tzinfo=timezone.utc)
+    rec = build_record(
+        meta=FIXTURE, result=TranscriptResult(text="Bonjour et voila", rows=ROWS, language="fr"),
+        english=" Hello ", note="n", model="small", transcribed_at=when,
+    )
+    assert rec["segments"] == [
+        {"start": 0.0, "end": 2.0, "text": "Bonjour"},
+        {"start": 65.0, "end": 70.0, "text": "et voila"},
+    ]
+    assert rec["english_text"] == "Hello" and rec["model"] == "small" and rec["note"] == "n"
+    assert rec["text"] == "Bonjour et voila" and rec["language"] == "fr"
+    assert rec["ytdlp_meta"] is FIXTURE and rec["transcribed_at"] == when
+    assert rec["caption"] == FIXTURE["description"].strip()

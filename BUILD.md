@@ -15,7 +15,7 @@ Design principles, in priority order:
 1. **Fully local and free.** No API keys, no hosted transcription, no accounts, no telemetry. Audio never leaves the machine.
 2. **Resumable.** Interrupting a run must never lose queue state or force re-downloading finished work.
 3. **Per-item failure isolation.** One dead link must not stop the other nine.
-4. **Boring.** No daemon, no web UI, no database. A script and a JSON file.
+4. **Boring.** No web UI, no hosted services. A script and one PostgreSQL schema. *(Amended: the original rule was "no database, a JSON file"; queue state and transcripts now live in the shared homelab PostgreSQL, schema `instagram_recap`, because daily-recap reads them there. The file-based design below is the historical v1 spec; `state.json` is superseded by the `reel`, `transcript` and `transcript_segment` tables, see `src/reelscribe/migrations/001_init.sql`. The Markdown export remains, behind `REELSCRIBE_WRITE_MARKDOWN`, default on.)*
 
 ## 2. Environment
 
@@ -196,7 +196,7 @@ Unit tests only. **No network calls in the test suite.**
 
 ## 12. Non-goals
 
-Do not build: a web UI, a database, a background daemon, speaker diarization, subtitle burn-in, video (as opposed to audio) retention, or any hosted-API fallback. Scheduling is the user's own cron or launchd — just document it:
+Do not build: a web UI, a background daemon (beyond the opt-in `serve`), speaker diarization, subtitle burn-in, video (as opposed to audio) retention, or any hosted-API fallback. Scheduling is the user's own cron or launchd — just document it:
 
 ```
 0 * * * * cd ~/reelscribe && /usr/bin/python3 -m reelscribe run >> run.log 2>&1
