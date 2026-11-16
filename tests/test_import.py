@@ -151,6 +151,31 @@ def test_import_refuses_non_empty_unless_replace(pg_url, source):
         assert counts["reels"] == 3 and counts["transcripts"] == 2
 
 
+def test_replace_refused_while_another_schema_depends_on_reels(pg_url, source):
+    home, state, dirs = source
+    imp.State.open(pg_url)
+    with psycopg.connect(pg_url) as conn:
+        imp.import_all(conn, state_file=state, markdown_dirs=dirs, home=home)
+        schema = conn.execute("SELECT current_schema()").fetchone()[0]
+        other = f"{schema}_dep"
+        conn.execute(f'CREATE SCHEMA "{other}"')
+        conn.execute(f'CREATE VIEW "{other}".reel_v AS SELECT id, shortcode FROM "{schema}".reel')
+        conn.commit()
+    try:
+        with psycopg.connect(pg_url) as conn:
+            assert imp.dependents(conn) == [f"view {other}.reel_v"]
+            with pytest.raises(SystemExit, match="refusing --replace"):
+                imp.import_all(conn, state_file=state, markdown_dirs=dirs, home=home, replace=True)
+        with psycopg.connect(pg_url) as conn:
+            assert conn.execute("SELECT count(*) FROM reel").fetchone()[0] == 3  # untouched
+            counts = imp.import_all(conn, state_file=state, markdown_dirs=dirs, home=home,
+                                    replace=True, force=True)
+            assert counts["reels"] == 3
+    finally:
+        with psycopg.connect(pg_url, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA "{other}" CASCADE')
+
+
 def test_main_prints_counts(pg_url, source, monkeypatch, capsys):
     home, state, dirs = source
     monkeypatch.setenv("REELSCRIBE_DATABASE_URL", pg_url)

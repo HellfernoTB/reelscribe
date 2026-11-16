@@ -12,6 +12,10 @@
   precision, so ``end_s`` is NULL). The first directory listed wins when the
   same reel appears twice; a file with no ``state.json`` item creates a ``done`` reel.
 - Refuses to run when ``reel`` is not empty unless ``--replace``.
+- ``--replace`` deletes every reel and re-inserts them with NEW identity ids. Other schemas
+  that point at reel ids (daily-recap: ``chunk.ref_id``, ``reel_recap.reel_ids``, through its
+  ``reel_v`` view) would then silently point at the wrong reels, so ``--replace`` is refused
+  while any object outside this schema depends on it (``pg_depend``), unless ``--force``.
 - The source files are only read, never modified.
 """
 
@@ -107,13 +111,45 @@ def relative_audio(raw: str | None, home: Path) -> str | None:
         return str(Path("audio") / path.name)  # reelscribe always stores home/audio/<stem>.mp3
 
 
+_DEPENDENTS = """
+WITH tgt AS (SELECT relnamespace AS oid FROM pg_class WHERE oid = 'reel'::regclass),
+dep AS (
+  SELECT DISTINCT
+    CASE WHEN d.classid = 'pg_rewrite'::regclass THEN 'pg_class'::regclass ELSE d.classid END AS classid,
+    CASE WHEN d.classid = 'pg_rewrite'::regclass THEN r.ev_class ELSE d.objid END AS objid
+  FROM pg_depend d
+  LEFT JOIN pg_rewrite r ON d.classid = 'pg_rewrite'::regclass AND r.oid = d.objid
+  WHERE d.deptype IN ('n', 'a') AND d.refclassid = 'pg_class'::regclass
+    AND d.refobjid IN (SELECT oid FROM pg_class WHERE relnamespace = (SELECT oid FROM tgt))
+)
+SELECT i.type || ' ' || i.identity
+FROM dep, pg_identify_object(dep.classid, dep.objid, 0) i
+WHERE i.schema IS NOT NULL AND i.schema <> (SELECT nspname FROM pg_namespace WHERE oid = (SELECT oid FROM tgt))
+ORDER BY 1
+"""
+
+
+def dependents(conn: psycopg.Connection) -> list[str]:
+    """Objects in OTHER schemas built on this schema's tables (e.g. ``view daily_recap.reel_v``)."""
+    return [row[0] for row in conn.execute(_DEPENDENTS).fetchall()]
+
+
 def import_all(conn: psycopg.Connection, *, state_file: Path | None, markdown_dirs: list[Path],
-               home: Path, replace: bool = False) -> dict:
+               home: Path, replace: bool = False, force: bool = False) -> dict:
     """Run the import inside one transaction. Returns the counts."""
     with conn.transaction():
         if conn.execute("SELECT count(*) FROM reel").fetchone()[0]:
             if not replace:
                 raise SystemExit("reel table is not empty; use --replace to wipe and reimport")
+            deps = dependents(conn)
+            if deps and not force:
+                raise SystemExit(
+                    "refusing --replace: reels get new ids, and these objects in other schemas depend on "
+                    f"them ({', '.join(deps)}); daily-recap's chunk.ref_id and reel_recap.reel_ids would "
+                    "point at the wrong reels. Add --force only if that data is rebuilt afterwards."
+                )
+            if deps:
+                print(f"warning: --force: reel ids change under {', '.join(deps)}", file=sys.stderr)
             conn.execute("DELETE FROM reel")  # cascades to transcript + segments
 
         reels: dict[str, int] = {}
@@ -196,7 +232,9 @@ def main(argv=None) -> int:
     p.add_argument("--state", type=Path, default=home / "state.json")
     p.add_argument("--markdown-dir", type=Path, action="append", dest="markdown_dirs",
                    help="folder of exported .md files (repeatable; default: REELSCRIBE_HOME/transcripts)")
-    p.add_argument("--replace", action="store_true", help="wipe existing reel data first")
+    p.add_argument("--replace", action="store_true", help="wipe existing reel data first (new reel ids)")
+    p.add_argument("--force", action="store_true",
+                   help="with --replace: go ahead although other schemas depend on the reels (daily-recap)")
     args = p.parse_args(argv)
 
     url = os.environ.get("REELSCRIBE_DATABASE_URL")
@@ -207,7 +245,7 @@ def main(argv=None) -> int:
     State.open(url)  # applies migrations
     with psycopg.connect(url) as conn:
         counts = import_all(conn, state_file=args.state, markdown_dirs=dirs, home=home,
-                            replace=args.replace)
+                            replace=args.replace, force=args.force)
     print("imported: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
     return 0
 

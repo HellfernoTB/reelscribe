@@ -57,6 +57,13 @@ reelscribe/
 
 ## 4. Data layout
 
+> **PostgreSQL (current).** The tables live in schema `instagram_recap` of the shared homelab
+> database; migrations are `src/reelscribe/migrations/*.sql`. daily-recap reads `reel` and
+> `transcript` through its view `daily_recap.reel_v` and stores `reel.id` values. Future migrations
+> that drop, rename or retype columns used by that view will fail at startup: coordinate with
+> daily-recap first (see `src/reelscribe/migrations/README.md`), and never renumber `reel.id`.
+> The file layout below is the historical v1 design.
+
 Root is `~/reelscribe/`, overridable with `REELSCRIBE_HOME`.
 
 ```
