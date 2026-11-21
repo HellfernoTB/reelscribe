@@ -3,10 +3,11 @@
 # Install:
 #   mkdir -p ~/.config/systemd/user
 #   cp scripts/reelscribe-serve.service ~/.config/systemd/user/
-#   # serve.env must contain at least REELSCRIBE_TOKEN; this setup keeps the
-#   # whole data root under the repo:
+#   # serve.env (mode 600) must contain REELSCRIBE_TOKEN and
+#   # REELSCRIBE_DATABASE_URL; this setup keeps the data root under the repo:
 #   #   REELSCRIBE_TOKEN=...
-#   #   REELSCRIBE_HOME=%h/reelscribe
+#   #   REELSCRIBE_DATABASE_URL=postgresql://instagram_recap:...@127.0.0.1:5433/homelab
+#   #   REELSCRIBE_HOME=%h/Homelab/Instagram-recap/data
 #   #   REELSCRIBE_MODEL=medium            # optional
 #   loginctl enable-linger "$USER"         # run without an active login session
 #   systemctl --user daemon-reload
@@ -20,12 +21,13 @@
 
 [Unit]
 Description=reelscribe HTTP ingestion endpoint
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=%h/reelscribe/serve.env
+EnvironmentFile=%h/Homelab/Instagram-recap/data/serve.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.local/bin/reelscribe serve
 Restart=on-failure
 RestartSec=5

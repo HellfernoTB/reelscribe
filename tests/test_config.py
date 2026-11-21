@@ -11,7 +11,10 @@ def test_defaults():
     assert cfg.language is None
     assert cfg.translate is False
     assert cfg.cookies is None
-    assert cfg.state_file.name == "state.json"
+    assert cfg.database_url is None
+    assert cfg.write_markdown is True
+    with pytest.raises(ConfigError, match="REELSCRIBE_DATABASE_URL"):
+        cfg.require_database_url()
     assert cfg.audio_dir.name == "audio"
 
 
@@ -90,3 +93,10 @@ def test_check_dependencies_reports_only_missing_one():
     with pytest.raises(ConfigError) as exc:
         check_dependencies(which=lambda b: None if b == "ffmpeg" else "/usr/bin/yt-dlp")
     assert "ffmpeg" in str(exc.value)
+
+
+def test_database_url_and_markdown_toggle():
+    cfg = Config(environ={"REELSCRIBE_DATABASE_URL": "postgresql://h/db",
+                          "REELSCRIBE_WRITE_MARKDOWN": "0"})
+    assert cfg.require_database_url() == "postgresql://h/db"
+    assert cfg.write_markdown is False

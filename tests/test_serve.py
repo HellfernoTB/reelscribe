@@ -1,15 +1,30 @@
 import json
+import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
+import psycopg
 import pytest
 
 from reelscribe import serve
 from reelscribe.config import Config
+from reelscribe.state import State
 
 
 @pytest.fixture
 def cfg():
     return Config(environ={"REELSCRIBE_TOKEN": "good-token"})
+
+
+@pytest.fixture
+def db_env(pg_url, tmp_path):
+    """Config environ for a throwaway schema."""
+    return {
+        "REELSCRIBE_HOME": str(tmp_path),
+        "REELSCRIBE_TOKEN": "tok",
+        "REELSCRIBE_DATABASE_URL": pg_url,
+        "REELSCRIBE_SERVE_ADDR": "127.0.0.1:0",
+    }
 
 
 @pytest.fixture
@@ -87,6 +102,17 @@ def test_add_duplicate_url_200_skipped(cfg, enqueue_spy):
     assert body["skipped"] == "https://x/reel/A"
 
 
+def test_add_returns_503_when_database_unreachable(cfg):
+    def enqueue(url):
+        raise psycopg.OperationalError("connection refused")
+
+    status, body = serve.handle(
+        "GET", "/add", {"url": "https://x/reel/A", "token": "good-token"}, cfg, enqueue
+    )
+    assert status == 503
+    assert "database" in body["error"]
+
+
 def test_post_body_params_accepted(cfg, enqueue_spy):
     status, body = serve.handle(
         "POST", "/add", {"url": "https://x/reel/Z", "token": "good-token"}, cfg, enqueue_spy
@@ -96,8 +122,8 @@ def test_post_body_params_accepted(cfg, enqueue_spy):
 
 # ---- Ingest: enqueue + worker ---------------------------------------
 
-def test_ingest_enqueue_dedupes(tmp_path):
-    cfg = Config(environ={"REELSCRIBE_HOME": str(tmp_path), "REELSCRIBE_TOKEN": "t"})
+def test_ingest_enqueue_dedupes(db_env):
+    cfg = Config(environ=db_env)
     ingest = serve.Ingest(cfg, run_once=lambda: None)
     norm1, new1 = ingest.enqueue("https://www.instagram.com/reel/ABC/?igsh=1")
     norm2, new2 = ingest.enqueue("instagram.com/reel/ABC")
@@ -105,8 +131,8 @@ def test_ingest_enqueue_dedupes(tmp_path):
     assert new1 is True and new2 is False
 
 
-def test_ingest_worker_drains_on_wake(tmp_path):
-    cfg = Config(environ={"REELSCRIBE_HOME": str(tmp_path), "REELSCRIBE_TOKEN": "t"})
+def test_ingest_worker_drains_on_wake(db_env):
+    cfg = Config(environ=db_env)
     drained = []
     ingest = serve.Ingest(cfg, run_once=lambda: drained.append(True))
 
@@ -118,8 +144,8 @@ def test_ingest_worker_drains_on_wake(tmp_path):
     assert drained  # run_once was invoked after the enqueue woke the worker
 
 
-def test_ingest_worker_survives_run_error(tmp_path):
-    cfg = Config(environ={"REELSCRIBE_HOME": str(tmp_path), "REELSCRIBE_TOKEN": "t"})
+def test_ingest_worker_survives_run_error(db_env):
+    cfg = Config(environ=db_env)
     calls = []
 
     def flaky():
@@ -140,14 +166,8 @@ def test_ingest_worker_survives_run_error(tmp_path):
 
 # ---- run_server: real socket smoke --------------------------------
 
-def test_server_end_to_end(tmp_path):
-    cfg = Config(
-        environ={
-            "REELSCRIBE_HOME": str(tmp_path),
-            "REELSCRIBE_TOKEN": "tok",
-            "REELSCRIBE_SERVE_ADDR": "127.0.0.1:0",
-        }
-    )
+def test_server_end_to_end(db_env, pg_url):
+    cfg = Config(environ=db_env)
     seen = []
     server = serve.build_server(cfg, run_once=lambda: seen.append(True))
     import threading
@@ -166,14 +186,11 @@ def test_server_end_to_end(tmp_path):
         server.shutdown()
         t.join(timeout=2)
 
-    from reelscribe.state import State
-
-    assert "https://x/reel/A" in State.load(tmp_path / "state.json").items
+    assert State(pg_url).get("https://x/reel/A")["status"] == "pending"
 
 
-def test_server_accepts_bearer_header(tmp_path):
-    cfg = Config(environ={"REELSCRIBE_HOME": str(tmp_path), "REELSCRIBE_TOKEN": "tok",
-                          "REELSCRIBE_SERVE_ADDR": "127.0.0.1:0"})
+def test_server_accepts_bearer_header(db_env):
+    cfg = Config(environ=db_env)
     server = serve.build_server(cfg, run_once=lambda: None)
     import threading
 
@@ -192,9 +209,8 @@ def test_server_accepts_bearer_header(tmp_path):
         t.join(timeout=2)
 
 
-def test_server_reads_form_body_on_get(tmp_path):
-    cfg = Config(environ={"REELSCRIBE_HOME": str(tmp_path), "REELSCRIBE_TOKEN": "tok",
-                          "REELSCRIBE_SERVE_ADDR": "127.0.0.1:0"})
+def test_server_reads_form_body_on_get(db_env):
+    cfg = Config(environ=db_env)
     server = serve.build_server(cfg, run_once=lambda: None)
     import threading
 
@@ -215,9 +231,8 @@ def test_server_reads_form_body_on_get(tmp_path):
         t.join(timeout=2)
 
 
-def test_server_rejects_bad_token_over_http(tmp_path):
-    cfg = Config(environ={"REELSCRIBE_HOME": str(tmp_path), "REELSCRIBE_TOKEN": "tok",
-                          "REELSCRIBE_SERVE_ADDR": "127.0.0.1:0"})
+def test_server_rejects_bad_token_over_http(db_env):
+    cfg = Config(environ=db_env)
     server = serve.build_server(cfg, run_once=lambda: None)
     import threading
 
@@ -231,3 +246,84 @@ def test_server_rejects_bad_token_over_http(tmp_path):
     finally:
         server.shutdown()
         t.join(timeout=2)
+
+
+def test_server_returns_503_over_http_when_db_down(tmp_path):
+    cfg = Config(environ={"REELSCRIBE_HOME": str(tmp_path), "REELSCRIBE_TOKEN": "tok",
+                          "REELSCRIBE_SERVE_ADDR": "127.0.0.1:0",
+                          "REELSCRIBE_DATABASE_URL": "postgresql://u:p@127.0.0.1:1/none"})
+    server = serve.build_server(cfg, run_once=lambda: None)  # starts even with the DB down
+    import threading
+
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        port = server.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/add?token=tok&url=https://x/reel/A")
+        assert exc.value.code == 503
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as r:
+            assert r.status == 200
+    finally:
+        server.shutdown()
+        t.join(timeout=2)
+
+
+def test_drain_resets_stale_running_rows_under_lock(db_env, pg_url, monkeypatch):
+    state = State.open(pg_url)
+    state.add("https://x/reel/A")
+    assert state.to_process() == ["https://x/reel/A"]  # a crashed worker left it running
+    seen = []
+    monkeypatch.setattr(serve, "process_item", lambda cfg, t, url: seen.append(url) or {
+        "text": "t", "transcribed_at": datetime.now(timezone.utc), "transcript_file": None})
+    monkeypatch.setattr(serve, "Transcriber", lambda *a, **k: object())
+    ingest = serve.Ingest(Config(environ=db_env))
+    ingest._default_drain()
+    ingest.stop()
+    assert seen == ["https://x/reel/A"]
+    assert state.get("https://x/reel/A")["status"] == "done"
+
+
+def test_drain_waits_while_another_worker_holds_lock(db_env, pg_url, monkeypatch):
+    monkeypatch.setattr(serve, "LOCK_RETRY_SECONDS", 0.05)
+    state = State.open(pg_url)
+    state.add("https://x/reel/A")
+    other = state.worker_lock()
+    assert other.acquire()
+    seen = []
+    monkeypatch.setattr(serve, "process_item", lambda cfg, t, url: seen.append(url) or {
+        "text": "t", "transcribed_at": datetime.now(timezone.utc), "transcript_file": None})
+    monkeypatch.setattr(serve, "Transcriber", lambda *a, **k: object())
+    ingest = serve.Ingest(Config(environ=db_env))
+    ingest.start()
+    ingest.enqueue("https://x/reel/B")  # /add still works while another worker holds the lock
+    import time
+    time.sleep(0.3)
+    assert seen == [] and state.get("https://x/reel/A")["status"] == "pending"
+    other.release()
+    ingest.wait_idle(timeout=5)
+    ingest.stop()
+    assert sorted(seen) == ["https://x/reel/A", "https://x/reel/B"]
+
+
+def test_default_drain_processes_and_releases(db_env, pg_url, monkeypatch):
+    seen = []
+
+    def fake_process(cfg, transcriber, url):
+        seen.append(url)
+        if url.endswith("/bad"):
+            raise RuntimeError("nope")
+        return {"text": "t", "transcribed_at": datetime.now(timezone.utc), "segments": [],
+                "transcript_file": None}
+
+    monkeypatch.setattr(serve, "process_item", fake_process)
+    monkeypatch.setattr(serve, "Transcriber", lambda *a, **k: object())
+    ingest = serve.Ingest(Config(environ=db_env))
+    ingest.enqueue("https://x/reel/ok")
+    ingest.enqueue("https://x/reel/bad")
+    ingest._default_drain()
+    ingest.stop()
+    state = State(pg_url)
+    assert state.get("https://x/reel/ok")["status"] == "done"
+    bad = state.get("https://x/reel/bad")
+    assert bad["status"] == "failed" and bad["attempts"] == 1 and "nope" in bad["last_error"]
